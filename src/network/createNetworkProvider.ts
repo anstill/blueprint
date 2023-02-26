@@ -6,6 +6,7 @@ import { TonHubProvider } from './send/TonHubProvider';
 import {
     Address,
     Cell,
+    comment,
     Contract,
     ContractProvider,
     openContract,
@@ -13,6 +14,8 @@ import {
     Sender,
     SenderArguments,
     SendMode,
+    toNano,
+    TupleItem,
 } from 'ton-core';
 import { TonClient } from 'ton';
 import { getHttpEndpoint } from '@orbs-network/ton-access';
@@ -59,6 +62,51 @@ class SendProviderSender implements Sender {
     }
 }
 
+class WrappedContractProvider implements ContractProvider {
+    #address: Address;
+    #provider: ContractProvider;
+    #init?: { code?: Cell; data?: Cell };
+
+    constructor(address: Address, provider: ContractProvider, init?: { code?: Cell; data?: Cell }) {
+        this.#address = address;
+        this.#provider = provider;
+        this.#init = init;
+    }
+
+    async getState() {
+        return await this.#provider.getState();
+    }
+
+    async get(name: string, args: TupleItem[]) {
+        return await this.#provider.get(name, args);
+    }
+
+    async external(message: Cell) {
+        return await this.#provider.external(message);
+    }
+
+    async internal(
+        via: Sender,
+        args: {
+            value: string | bigint;
+            bounce: boolean | undefined | null;
+            sendMode?: SendMode;
+            body: string | Cell | undefined | null;
+        }
+    ) {
+        const init = this.#init && (await this.getState()).state.type !== 'active' ? this.#init : undefined;
+
+        return await via.send({
+            to: this.#address,
+            value: typeof args.value === 'string' ? toNano(args.value) : args.value,
+            sendMode: args.sendMode,
+            bounce: args.bounce,
+            init,
+            body: typeof args.body === 'string' ? comment(args.body) : args.body,
+        });
+    }
+}
+
 class NetworkProviderImpl implements NetworkProvider {
     #tc: TonClient;
     #sender: Sender;
@@ -85,10 +133,44 @@ class NetworkProviderImpl implements NetworkProvider {
     }
 
     provider(addr: Address, init?: { code?: Cell; data?: Cell }): ContractProvider {
-        return this.#tc.provider(addr, init ? { code: init.code ?? null, data: init.data ?? null } : null);
+        return new WrappedContractProvider(
+            addr,
+            this.#tc.provider(addr, init ? { code: init.code ?? null, data: init.data ?? null } : null),
+            init
+        );
     }
 
-    async deploy(contract: Contract, value: bigint, body?: Cell, waitAttempts: number = 10): Promise<void> {
+    async waitForDeploy(address: Address, attempts: number = 10, sleepDuration: number = 2000) {
+        if (attempts <= 0) {
+            throw new Error('Attempt number must be positive');
+        }
+
+        for (let i = 1; i <= attempts; i++) {
+            this.#ui.setActionPrompt(`Awaiting contract deployment... [Attempt ${i}/${attempts}]`);
+            const isDeployed = await this.#tc.isContractDeployed(address);
+            if (isDeployed) {
+                this.#ui.clearActionPrompt();
+                this.#ui.write('Contract deployed!');
+                this.#ui.write(
+                    `You can view it at https://${
+                        this.#network === 'testnet' ? 'testnet.' : ''
+                    }tonscan.org/address/${address.toString()}`
+                );
+                return;
+            }
+            await sleep(sleepDuration);
+        }
+
+        this.#ui.clearActionPrompt();
+        throw new Error("Contract was not deployed. Check your wallet's transactions");
+    }
+
+    /**
+     * @deprecated
+     *
+     * Use your Contract's `sendDeploy` method (or similar) together with `waitForDeploy` instead.
+     */
+    async deploy(contract: Contract, value: bigint, body?: Cell, waitAttempts: number = 10) {
         const isDeployed = await this.#tc.isContractDeployed(contract.address);
         if (isDeployed) {
             throw new Error('Contract is already deployed!');
@@ -107,28 +189,11 @@ class NetworkProviderImpl implements NetworkProvider {
 
         if (waitAttempts <= 0) return;
 
-        for (let i = 1; i <= waitAttempts; i++) {
-            this.#ui.setActionPrompt(`Awaiting contract deployment... [Attempt ${i}/${waitAttempts}]`);
-            const isDeployed = await this.#tc.isContractDeployed(contract.address);
-            if (isDeployed) {
-                this.#ui.clearActionPrompt();
-                this.#ui.write('Contract deployed!');
-                this.#ui.write(
-                    `You can view it at https://${
-                        this.#network === 'testnet' ? 'testnet.' : ''
-                    }tonscan.org/address/${contract.address.toString()}`
-                );
-                return;
-            }
-            await sleep(2000);
-        }
-
-        this.#ui.clearActionPrompt();
-        throw new Error("Contract was not deployed. Check your wallet's transactions");
+        await this.waitForDeploy(contract.address, waitAttempts);
     }
 
     open<T extends Contract>(contract: T): OpenedContract<T> {
-        return openContract(contract, (params) => this.#tc.provider(params.address, params.init));
+        return openContract(contract, (params) => this.provider(params.address, params.init ?? undefined));
     }
 
     ui(): UIProvider {
